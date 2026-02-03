@@ -1,0 +1,25 @@
+# results  outputs
+result
+results
+runs
+checkpoints
+.log
+
+# big data  models
+.npy
+.npz
+.pt
+.pth
+.ckpt
+.pkl
+.pickle
+
+# python cache  ide
+__pycache__
+.pyc
+.idea
+.vscode
+
+# system
+.DS_Store
+Thumbs.db
