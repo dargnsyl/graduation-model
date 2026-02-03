@@ -30,7 +30,7 @@ train:
   method: normal
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  epochs: 20
+  epochs: 30
   optimizer: adam
 
   group_loss: true

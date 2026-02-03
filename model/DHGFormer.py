@@ -14,47 +14,33 @@ class CrossEmbed2GraphByProduct(nn.Module):
     def __init__(self, input_dim, roi_num=264):
         super().__init__()
 
-    def get_subnetwork_matrix(self, adjacency_matrix, subnetwork_ends):
-        subnetwork_starts = [0] + subnetwork_ends[:-1]#包含8个子网起始节点的序号[0, 41, 70, 91, 110, 130, 137, 158]
-        num_subnetworks = len(subnetwork_ends)#8个子网[41, 70, 91, 110, 130, 137, 158, 200]
-        batch_size = adjacency_matrix.shape[0]#16
-        subnetwork_matrix = torch.zeros((batch_size, num_subnetworks, num_subnetworks),
-                                        device=adjacency_matrix.device)#[16,8,8]
+    def get_subnetwork_matrix(self, adjacency_matrix, assignment, eps=1e-6):
+        # assignment: [N, K], soft membership of each node to K subnetworks
+        # Compute weighted mean connectivity between subnetworks
+        # numerator: A^T * adjacency * A
+        # adjacency: [B, N, N], assignment: [N, K] -> [B, K, K]
+        temp = torch.einsum('bnm,nk->bkm', adjacency_matrix, assignment)
+        subnetwork_matrix = torch.einsum('bkm,ml->bkl', temp, assignment)
 
-        for i in range(num_subnetworks):
-            for j in range(i, num_subnetworks):
-                block = adjacency_matrix[:,
-                        subnetwork_starts[i]:subnetwork_ends[i],
-                        subnetwork_starts[j]:subnetwork_ends[j]]#取出子网络i和子网络j之间的邻接矩阵
-                mean_strength = block.mean(dim=(1, 2))#[16]，对block在第1维和第2维同时取平均，视为子网络i和j之间的连接强度
-                subnetwork_matrix[:, i, j] = mean_strength
-                subnetwork_matrix[:, j, i] = mean_strength
-        return subnetwork_matrix#[16,8,8]
+        weights = assignment.sum(dim=0)  # [K]
+        denom = torch.outer(weights, weights).clamp_min(eps)  # [K, K]
+        subnetwork_matrix = subnetwork_matrix / denom.unsqueeze(0)
+        return subnetwork_matrix
 
-    def forward(self, embeddings, subnetwork_ends):
+    def forward(self, embeddings, assignment):
         # Compute full adjacency matrix
-        #embeddings维度[16,200,8]，与自己的转置相乘得到adjacency_matrix，对应论文中X_A与自己的转置相乘得到矩阵A
+        #embeddings???[16,200,8]?????????????????djacency_matrix?????????X_A??????????????????A
         adjacency_matrix = torch.einsum('ijk,ipk->ijp', embeddings, embeddings)#[16,200,200]
 
-        roi_count = embeddings.shape[1]#200
-        start_index = 0
-        device = embeddings.device
-        intra_mask = torch.zeros((roi_count, roi_count), dtype=torch.bool, device=device)#[200,200]
-
-        for end_index in subnetwork_ends:
-            intra_mask[start_index:end_index, start_index:end_index] = True
-            start_index = end_index
-#最终intra_mask仍为[200,200]的bool型矩阵，对于subnetwork_ends中的每个数，例如41和70，以intra_mask[0][0]和intra_mask[41][41]为
-#左上、右下顶点的子矩阵均为true
-#以intra_mask[41][41]和intra_mask[70][70]为左上、右下顶点的子矩阵均为true
-#以此类推，intra_mask按主对角线划分为8个大小不等的子矩阵，这些子矩阵元素全为true，不在这8个子矩阵中的全为flase
-
+        # Soft intra-mask: probability that two nodes belong to the same subnetwork
+        # intra_mask: [N, N]
+        intra_mask = torch.matmul(assignment, assignment.t())
         intra_adjacency = adjacency_matrix * intra_mask.unsqueeze(0)
-#intra_adjacency维度仍为[16,200,200]，根据intra_mask为true的位置不变，false的位置设为0
-#这样intra_adjacency也可看作由8个子矩阵构成的对角阵，表示8个子网
+#intra_adjacency??????[16,200,200]?????ntra_mask??rue?????????false????????
+#???intra_adjacency?????????????????????????????????
 
         # Compute subnetwork-level connectivity
-        inter_adjacency = self.get_subnetwork_matrix(adjacency_matrix, subnetwork_ends)#[16,8,8]
+        inter_adjacency = self.get_subnetwork_matrix(adjacency_matrix, assignment)#[16,8,8]
 
         # Add channel dimension for consistency
         intra_adjacency = torch.unsqueeze(intra_adjacency, -1)
@@ -69,8 +55,6 @@ class CrossGCNPredictor(nn.Module):
     def __init__(self, node_input_dim, roi_num=360):
         super().__init__()
         self.roi_num = roi_num
-        self.subnetwork_ends = [41, 70, 91, 110, 130, 137, 158, 200]
-
         # Graph convolution layers
         self.gcn = nn.Sequential(
             nn.Linear(node_input_dim, roi_num),
@@ -102,44 +86,27 @@ class CrossGCNPredictor(nn.Module):
             nn.Linear(32, 2)
         )
 
-    def average_subnetwork_features(self, features, subnetwork_ends):
-        batch_size, _, feature_dim = features.shape#16,200,200
-        num_subnetworks = len(subnetwork_ends)#8
-        subnetwork_starts = [0] + subnetwork_ends[:-1]#[0, 41, 70, 91, 110, 130, 137, 158]
-        subnetwork_features = torch.zeros((batch_size, num_subnetworks, feature_dim),
-                                          device=features.device)#[16,8,200]
+    def average_subnetwork_features(self, features, assignment, eps=1e-6):
+        # features: [B, N, F], assignment: [N, K]
+        weighted_sum = torch.einsum('bnf,nk->bkf', features, assignment)
+        weights = assignment.sum(dim=0).clamp_min(eps)  # [K]
+        subnetwork_features = weighted_sum / weights.view(1, -1, 1)
+        return subnetwork_features#[16,8,200]???8????????????????????????200?????
 
-        for i in range(num_subnetworks):
-            start_idx = subnetwork_starts[i]
-            end_idx = subnetwork_ends[i]
-            region_features = features[:, start_idx:end_idx, :]
-            subnetwork_features[:, i, :] = region_features.mean(dim=1)
-
-        return subnetwork_features#[16,8,200]表示8个子网，每个子网特征是一个长度为200的向量
-
-    def propagate_subnetwork_features(self, subnetwork_features, node_features, subnetwork_ends):
-        subnetwork_starts = [0] + subnetwork_ends[:-1]#0, 41, 70, 91, 110, 130, 137, 158
-        num_subnetworks = len(subnetwork_ends)#8
-        propagated_features = torch.zeros_like(node_features)#子网特征由[16,8,200]扩展到[16,200,200]，方法在以下for循环中
-        for i in range(num_subnetworks):
-            start_idx = subnetwork_starts[i]
-            end_idx = subnetwork_ends[i]
-            # Expand subnetwork feature to match region count，subnetwork_features维度是[16,8,200]
-            #取出第i个子网的特征，维度是[16,200]，在中间加一个维度[16,1,200]，然后把中间的维度扩展为子网中节点数[16,N,200]得到expanded_features
-            expanded_features = subnetwork_features[:, i, :].unsqueeze(1).expand(-1, end_idx - start_idx, -1)
-            propagated_features[:, start_idx:end_idx, :] = expanded_features
-
+    def propagate_subnetwork_features(self, subnetwork_features, node_features, assignment):
+        # subnetwork_features: [B, K, F], assignment: [N, K]
+        propagated_features = torch.einsum('nk,bkf->bnf', assignment, subnetwork_features)
         # Combine original and propagated features
         return (node_features + propagated_features) / 2 #[16,200,200]
 
-    def forward(self, adjacency_matrix, intra_adjacency, inter_adjacency, node_features):
+    def forward(self, adjacency_matrix, intra_adjacency, inter_adjacency, node_features, assignment):
         batch_size = intra_adjacency.shape[0]#16
 
         # First propagation layer
         intra_features = torch.einsum('ijk,ijp->ijp', intra_adjacency, node_features)#[16,200,200]，表示子网内特征
-        subnetwork_features = self.average_subnetwork_features(node_features, self.subnetwork_ends)#[16,8,200]表示8个子网的特征
+        subnetwork_features = self.average_subnetwork_features(node_features, assignment)#[16,8,200]表示8个子网的特征
         subnetwork_features = torch.einsum('ijk,ijp->ijp', inter_adjacency, subnetwork_features)#[16,8,200]
-        x = self.propagate_subnetwork_features(subnetwork_features, intra_features, self.subnetwork_ends)#[16,200,200]
+        x = self.propagate_subnetwork_features(subnetwork_features, intra_features, assignment)#[16,200,200]
         x = self.gcn(x)#[16,200,200]
 
         x = x.reshape((batch_size * self.roi_num, -1))#[3200,200]
@@ -148,9 +115,9 @@ class CrossGCNPredictor(nn.Module):
 
         # Second propagation layer
         intra_features = torch.einsum('ijk,ijp->ijp', intra_adjacency, x)#[16,200,200]
-        subnetwork_features = self.average_subnetwork_features(x, self.subnetwork_ends)
+        subnetwork_features = self.average_subnetwork_features(x, assignment)
         subnetwork_features = torch.einsum('ijk,ijp->ijp', inter_adjacency, subnetwork_features)#[16,8,200]
-        x = self.propagate_subnetwork_features(subnetwork_features, intra_features, self.subnetwork_ends)#[16,200,200]
+        x = self.propagate_subnetwork_features(subnetwork_features, intra_features, assignment)#[16,200,200]
         x = self.gcn1(x)
 
         x = x.reshape((batch_size * self.roi_num, -1))
@@ -159,9 +126,9 @@ class CrossGCNPredictor(nn.Module):
 
         # Third propagation layer
         intra_features = torch.einsum('ijk,ijp->ijp', intra_adjacency, x)
-        subnetwork_features = self.average_subnetwork_features(x, self.subnetwork_ends)
+        subnetwork_features = self.average_subnetwork_features(x, assignment)
         subnetwork_features = torch.einsum('ijk,ijp->ijp', inter_adjacency, subnetwork_features)
-        x = self.propagate_subnetwork_features(subnetwork_features, intra_features, self.subnetwork_ends)#[16,200,200]
+        x = self.propagate_subnetwork_features(subnetwork_features, intra_features, assignment)#[16,200,200]
         x = self.gcn2(x)#[16,200,8]，gcn2里面的两个全连接层把特征维度从200到64到8
         x = self.bn3(x)#[16,200,8]
 
@@ -240,8 +207,27 @@ class DHGFormer(nn.Module):
         with open('./node_clus_map.pickle', 'rb') as f:
             self.node_cluster_map = pickle.load(f)
 
-        self.subnetwork_ends = [41, 70, 91, 110, 130, 137, 158, 200]
+        self.num_subnetworks = model_config.get('num_subnetworks', 8)
+        self.subnetwork_temperature = model_config.get('subnetwork_temperature', 1.0)
+        self.subnetwork_ends = model_config.get('subnetwork_ends', [41, 70, 91, 110, 130, 137, 158, 200])
         self.cluster_order = list(self.node_cluster_map.keys())
+        self.subnetwork_logits = nn.Parameter(
+            self._init_subnetwork_logits(roi_num, self.num_subnetworks, self.subnetwork_ends)
+        )
+        self.last_assignment_entropy = None
+
+    def _init_subnetwork_logits(self, roi_num, num_subnetworks, subnetwork_ends):
+        logits = torch.zeros(roi_num, num_subnetworks)
+        if num_subnetworks == len(subnetwork_ends) and subnetwork_ends[-1] == roi_num:
+            logits[:] = -2.0
+            starts = [0] + subnetwork_ends[:-1]
+            for k, (s, e) in enumerate(zip(starts, subnetwork_ends)):
+                logits[s:e, k] = 2.0
+        return logits
+
+    def get_subnetwork_assignment(self):
+        temperature = max(self.subnetwork_temperature, 1e-6)
+        return F.softmax(self.subnetwork_logits / temperature, dim=-1)
 
     def reorder_nodes(self, features, dimension=1):
         """Reorder features according to cluster mapping"""
@@ -255,11 +241,15 @@ class DHGFormer(nn.Module):
 
         # Extract features and generate graph
         embeddings = self.feature_extractor(time_series, node_features)#feature_extractor就是Encoder
-        embeddings = F.softmax(embeddings, dim=-1)#[16,200,8]，对应论文中的X_A
+        embeddings = F.softmax(embeddings, dim=-1)
+
+        assignment = self.get_subnetwork_assignment()
+        # Entropy regularization term (can be added to loss externally)
+        self.last_assignment_entropy = (-assignment * torch.log(assignment + 1e-8)).sum(dim=-1).mean()#[16,200,8]，对应论文中的X_A
 
         # Generate adjacency matrices
         intra_adjacency, inter_adjacency, full_adjacency = self.graph_generator(
-            embeddings, self.subnetwork_ends
+            embeddings, assignment
         )#self.graph_generator对应CrossEmbed2GraphByProduct
 
         # Remove channel dimension
@@ -276,7 +266,8 @@ class DHGFormer(nn.Module):
             full_adjacency,
             intra_adjacency,
             inter_adjacency,
-            node_features
+            node_features,
+            assignment
         )
 
         return prediction, full_adjacency, edge_variance#维度分别是[16,2]，[16,200,200]和一个数
