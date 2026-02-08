@@ -36,7 +36,7 @@ def _compute_shortest_dist(adj, max_hop):
     return dist
 
 
-def attention(Q, K, V, mask=None, topo_gamma=1.0, topo_tau=2.0, topo_max_hop=6, topo_eps=1e-6):
+def attention(Q, K, V, mask=None, topo_gamma=1.0, topo_tau=2.0, topo_max_hop=6, topo_eps=1e-6, topo_k=10):
     # Q,K,V: [B, H, N, D]
     l = Q.shape[2]
     num_head = Q.shape[1]
@@ -50,7 +50,14 @@ def attention(Q, K, V, mask=None, topo_gamma=1.0, topo_tau=2.0, topo_max_hop=6, 
         fc_bias = fc_bias.unsqueeze(1).expand(-1, num_head, -1, -1)
         score = score + fc_bias
 
-        adj = (mask > 0)
+        fc = torch.abs(mask)
+        bsz, n, _ = fc.shape
+        diag_idx = torch.arange(n, device=fc.device)
+        fc[:, diag_idx, diag_idx] = float("-inf")
+        idx = fc.topk(topo_k, dim=-1).indices  # [B, N, K]
+        adj = torch.zeros_like(fc, dtype=torch.bool)
+        adj.scatter_(-1, idx, True)
+        adj = adj | adj.transpose(-1, -2)
         dist = _compute_shortest_dist(adj, topo_max_hop)
         dist = dist.clamp_max(topo_max_hop + 1)
         decay = torch.exp(-topo_gamma * torch.relu(dist - topo_tau))
