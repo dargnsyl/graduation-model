@@ -33,6 +33,7 @@ class BasicTrain:
 
         self.sparsity_loss = train_config['sparsity_loss']
         self.sparsity_loss_weight = train_config['sparsity_loss_weight']
+        self.topo_reg_loss_weight = train_config.get('topo_reg_loss_weight', 1.0)
         self.save_path = log_folder
 
         self.save_learnable_graph = True
@@ -78,6 +79,10 @@ class BasicTrain:
                 sparsity_loss = self.sparsity_loss_weight * \
                                 torch.norm(learnable_matrix, p=1)
                 loss += sparsity_loss
+
+            topo_reg = getattr(self.model, 'topo_reg_loss', None)
+            if topo_reg is not None:
+                loss += self.topo_reg_loss_weight * topo_reg
 
             self.train_loss.update_with_weight(loss.item(), label.shape[0])
             optimizer.zero_grad()
@@ -147,7 +152,7 @@ class BasicTrain:
         training_process = []
         txt = ''
         for epoch in range(self.epochs):
-            self.reset_meters()                                  #重置计量器
+            self.reset_meters()                                  #重置计量�?
             self.train_per_epoch(self.optimizers[0])
             val_result, _ = self.test_per_epoch(self.val_dataloader,
                                              self.val_loss, self.val_accuracy)
@@ -196,3 +201,4 @@ class BasicTrain:
         if self.save_learnable_graph:
             self.generate_save_learnable_matrix()
         self.save_result(training_process, txt)
+
