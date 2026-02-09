@@ -65,44 +65,29 @@ class CrossEmbed2GraphByProduct(nn.Module):
 
 
 
-class AdditiveRFFFeatureMap(nn.Module):
 
-    def __init__(self, in_dim, proj_dim=256, num_groups=8, rff_per_group=128, sigma=1.0, dropout=0.1):
+class TokenAdditiveRFF(nn.Module):
+
+    def __init__(self, token_dim=8, num_tokens=8, rff_dim=128, sigma=1.0):
         super().__init__()
-        assert proj_dim % num_groups == 0
-        self.in_dim = in_dim
-        self.proj_dim = proj_dim
-        self.num_groups = num_groups
-        self.rff_per_group = rff_per_group
-        self.group_dim = proj_dim // num_groups
+        self.token_dim = token_dim
+        self.num_tokens = num_tokens
+        self.rff_dim = rff_dim
         self.sigma = sigma
 
-        self.phi = nn.Sequential(
-            nn.Linear(in_dim, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, proj_dim),
-            nn.LayerNorm(proj_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        for g in range(num_groups):
-            W = torch.randn(rff_per_group, self.group_dim) / sigma
-            b = 2 * math.pi * torch.rand(rff_per_group)
+        for g in range(num_tokens):
+            W = torch.randn(token_dim, rff_dim) / sigma
+            b = 2 * math.pi * torch.rand(rff_dim)
             self.register_buffer(f"rff_W_{g}", W)
             self.register_buffer(f"rff_b_{g}", b)
 
-    def forward(self, g):
-        h = self.phi(g)
-        chunks = torch.chunk(h, self.num_groups, dim=-1)
+    def forward(self, tokens):
         feats = []
-        scale = math.sqrt(2.0 / self.rff_per_group)
-        for i, h_i in enumerate(chunks):
-            W = getattr(self, f"rff_W_{i}")
-            b = getattr(self, f"rff_b_{i}")
-            proj = F.linear(h_i, W, b)
+        scale = math.sqrt(2.0 / self.rff_dim)
+        for g in range(self.num_tokens):
+            W = getattr(self, f"rff_W_{g}")
+            b = getattr(self, f"rff_b_{g}")
+            proj = tokens[:, g, :] @ W + b
             z = scale * torch.cos(proj)
             feats.append(z)
         return torch.cat(feats, dim=-1)
@@ -121,7 +106,7 @@ class BayesianLinearClassifier(nn.Module):
         self.b_mu = nn.Parameter(torch.zeros(num_classes))
         self.b_logvar = nn.Parameter(torch.zeros(num_classes))
 
-    def forward(self, z, mc_samples=1):
+    def forward(self, z, mc_samples=3):
         if mc_samples < 1:
             mc_samples = 1
         eps_w = torch.randn(mc_samples, self.num_classes, self.feat_dim, device=z.device)
@@ -139,23 +124,16 @@ class BayesianLinearClassifier(nn.Module):
         return kl_w + kl_b
 
 
-class DKLBayesHead(nn.Module):
+class SubnetTokenDKLBayesHead(nn.Module):
 
-    def __init__(self, in_dim, num_classes=2, proj_dim=256, num_groups=8, rff_per_group=128):
+    def __init__(self, num_tokens=8, token_dim=8, rff_dim=128, num_classes=2):
         super().__init__()
-        self.feat = AdditiveRFFFeatureMap(
-            in_dim=in_dim,
-            proj_dim=proj_dim,
-            num_groups=num_groups,
-            rff_per_group=rff_per_group,
-            sigma=1.0,
-            dropout=0.1,
-        )
-        feat_dim = num_groups * rff_per_group
+        self.rff = TokenAdditiveRFF(token_dim=token_dim, num_tokens=num_tokens, rff_dim=rff_dim, sigma=1.0)
+        feat_dim = num_tokens * rff_dim
         self.bayes = BayesianLinearClassifier(feat_dim=feat_dim, num_classes=num_classes)
 
-    def forward(self, g, mc_samples=1):
-        z = self.feat(g)
+    def forward(self, tokens, mc_samples=3):
+        z = self.rff(tokens)
         logits = self.bayes(z, mc_samples=mc_samples)
         kl = self.bayes.kl_divergence()
         return logits, kl
@@ -200,6 +178,9 @@ class CrossGCNPredictor(nn.Module):
             nn.LeakyReLU(negative_slope=0.2),
             nn.Linear(32, 2)
         )
+
+    def subnetwork_pool_tokens(self, roi_feat, subnetwork_ends):
+        return self.average_subnetwork_features(roi_feat, subnetwork_ends)
 
     def average_subnetwork_features(self, features, subnetwork_ends):
         batch_size, _, feature_dim = features.shape#16,200,200
@@ -263,6 +244,9 @@ class CrossGCNPredictor(nn.Module):
         x = self.propagate_subnetwork_features(subnetwork_features, intra_features, self.subnetwork_ends)#[16,200,200]
         x = self.gcn2(x)#[16,200,8]，gcn2里面的两个全连接层把特征维度�?00�?4�?
         x = self.bn3(x)#[16,200,8]
+
+        tokens = self.subnetwork_pool_tokens(x, self.subnetwork_ends)
+        self.subnet_tokens = tokens
 
         # Classifier
         x = x.view(batch_size, -1)#后两个维度合并得到[16,1600]
@@ -341,11 +325,10 @@ class DHGFormer(nn.Module):
 
         self.predictor = CrossGCNPredictor(node_feature_dim, roi_num=roi_num)
 
-        # Deep additive kernel features + last-layer Bayesian linear model
-        self.use_dkl_bayes = False
-        self.dkl_bayes_head = DKLBayesHead(in_dim=8 * roi_num, num_classes=2, proj_dim=256, num_groups=8, rff_per_group=128)
-        self.bayes_kl = torch.tensor(0.0)
+        self.use_token_dkl_bayes = False
+        self.token_bayes_head = SubnetTokenDKLBayesHead(num_tokens=8, token_dim=8, rff_dim=128, num_classes=2)
         self.bayes_logits = None
+        self.bayes_kl = torch.tensor(0.0)
 
 
         # Load node cluster mapping
@@ -393,13 +376,13 @@ class DHGFormer(nn.Module):
         )
 
         self.readout = getattr(self.predictor, "readout", None)
-        g = getattr(self, "readout", None)
-        if g is not None and self.use_dkl_bayes:
-            bayes_logits, bayes_kl = self.dkl_bayes_head(g.detach(), mc_samples=3)
-            self.bayes_kl = bayes_kl
+        tokens = getattr(self.predictor, "subnet_tokens", None)
+        if tokens is not None and self.use_token_dkl_bayes:
+            bayes_logits, bayes_kl = self.token_bayes_head(tokens.detach(), mc_samples=3)
             self.bayes_logits = bayes_logits
+            self.bayes_kl = bayes_kl
         else:
-            self.bayes_kl = torch.tensor(0.0, device=prediction.device)
             self.bayes_logits = None
+            self.bayes_kl = torch.tensor(0.0, device=prediction.device)
 
         return prediction, full_adjacency, edge_variance#维度分别是[16,2]，[16,200,200]和一个数
