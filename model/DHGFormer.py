@@ -64,6 +64,105 @@ class CrossEmbed2GraphByProduct(nn.Module):
         return intra_adjacency, inter_adjacency, adjacency_matrix
 
 
+
+class AdditiveRFFFeatureMap(nn.Module):
+
+    def __init__(self, in_dim, proj_dim=256, num_groups=8, rff_per_group=128, sigma=1.0, dropout=0.1):
+        super().__init__()
+        assert proj_dim % num_groups == 0
+        self.in_dim = in_dim
+        self.proj_dim = proj_dim
+        self.num_groups = num_groups
+        self.rff_per_group = rff_per_group
+        self.group_dim = proj_dim // num_groups
+        self.sigma = sigma
+
+        self.phi = nn.Sequential(
+            nn.Linear(in_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, proj_dim),
+            nn.LayerNorm(proj_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        for g in range(num_groups):
+            W = torch.randn(rff_per_group, self.group_dim) / sigma
+            b = 2 * math.pi * torch.rand(rff_per_group)
+            self.register_buffer(f"rff_W_{g}", W)
+            self.register_buffer(f"rff_b_{g}", b)
+
+    def forward(self, g):
+        h = self.phi(g)
+        chunks = torch.chunk(h, self.num_groups, dim=-1)
+        feats = []
+        scale = math.sqrt(2.0 / self.rff_per_group)
+        for i, h_i in enumerate(chunks):
+            W = getattr(self, f"rff_W_{i}")
+            b = getattr(self, f"rff_b_{i}")
+            proj = F.linear(h_i, W, b)
+            z = scale * torch.cos(proj)
+            feats.append(z)
+        return torch.cat(feats, dim=-1)
+
+
+class BayesianLinearClassifier(nn.Module):
+
+    def __init__(self, feat_dim, num_classes=2, prior_var=1.0):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.num_classes = num_classes
+        self.prior_var = prior_var
+
+        self.W_mu = nn.Parameter(torch.zeros(num_classes, feat_dim))
+        self.W_logvar = nn.Parameter(torch.zeros(num_classes, feat_dim))
+        self.b_mu = nn.Parameter(torch.zeros(num_classes))
+        self.b_logvar = nn.Parameter(torch.zeros(num_classes))
+
+    def forward(self, z, mc_samples=1):
+        if mc_samples < 1:
+            mc_samples = 1
+        eps_w = torch.randn(mc_samples, self.num_classes, self.feat_dim, device=z.device)
+        eps_b = torch.randn(mc_samples, self.num_classes, device=z.device)
+        W = self.W_mu + torch.exp(0.5 * self.W_logvar) * eps_w
+        b = self.b_mu + torch.exp(0.5 * self.b_logvar) * eps_b
+        logits = torch.einsum('bd,scd->sbc', z, W) + b.unsqueeze(1)
+        return logits.mean(dim=0)
+
+    def kl_divergence(self):
+        var_w = torch.exp(self.W_logvar)
+        var_b = torch.exp(self.b_logvar)
+        kl_w = 0.5 * ((var_w + self.W_mu ** 2) / self.prior_var - 1.0 - self.W_logvar + math.log(self.prior_var)).sum()
+        kl_b = 0.5 * ((var_b + self.b_mu ** 2) / self.prior_var - 1.0 - self.b_logvar + math.log(self.prior_var)).sum()
+        return kl_w + kl_b
+
+
+class DKLBayesHead(nn.Module):
+
+    def __init__(self, in_dim, num_classes=2, proj_dim=256, num_groups=8, rff_per_group=128):
+        super().__init__()
+        self.feat = AdditiveRFFFeatureMap(
+            in_dim=in_dim,
+            proj_dim=proj_dim,
+            num_groups=num_groups,
+            rff_per_group=rff_per_group,
+            sigma=1.0,
+            dropout=0.1,
+        )
+        feat_dim = num_groups * rff_per_group
+        self.bayes = BayesianLinearClassifier(feat_dim=feat_dim, num_classes=num_classes)
+
+    def forward(self, g, mc_samples=1):
+        z = self.feat(g)
+        logits = self.bayes(z, mc_samples=mc_samples)
+        kl = self.bayes.kl_divergence()
+        return logits, kl
+
+
+
+
 class CrossGCNPredictor(nn.Module):
 
     def __init__(self, node_input_dim, roi_num=360):
@@ -167,7 +266,9 @@ class CrossGCNPredictor(nn.Module):
 
         # Classifier
         x = x.view(batch_size, -1)#后两个维度合并得到[16,1600]
-        return self.classifier(x)#其实就是3个全连接层，把特征维度从1600�?56�?2�?
+        self.readout = x
+        logits = self.classifier(x)
+        return logits#其实就是3个全连接层，把特征维度从1600�?56�?2�?
 
 
 class Embed2GraphByLinear(nn.Module):
@@ -240,6 +341,13 @@ class DHGFormer(nn.Module):
 
         self.predictor = CrossGCNPredictor(node_feature_dim, roi_num=roi_num)
 
+        # Deep additive kernel features + last-layer Bayesian linear model
+        self.use_dkl_bayes = False
+        self.dkl_bayes_head = DKLBayesHead(in_dim=8 * roi_num, num_classes=2, proj_dim=256, num_groups=8, rff_per_group=128)
+        self.bayes_kl = torch.tensor(0.0)
+        self.bayes_logits = None
+
+
         # Load node cluster mapping
         with open('./node_clus_map.pickle', 'rb') as f:
             self.node_cluster_map = pickle.load(f)
@@ -283,5 +391,15 @@ class DHGFormer(nn.Module):
             inter_adjacency,
             node_features
         )
+
+        self.readout = getattr(self.predictor, "readout", None)
+        g = getattr(self, "readout", None)
+        if g is not None and self.use_dkl_bayes:
+            bayes_logits, bayes_kl = self.dkl_bayes_head(g.detach(), mc_samples=3)
+            self.bayes_kl = bayes_kl
+            self.bayes_logits = bayes_logits
+        else:
+            self.bayes_kl = torch.tensor(0.0, device=prediction.device)
+            self.bayes_logits = None
 
         return prediction, full_adjacency, edge_variance#维度分别是[16,2]，[16,200,200]和一个数

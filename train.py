@@ -34,6 +34,9 @@ class BasicTrain:
         self.sparsity_loss = train_config['sparsity_loss']
         self.sparsity_loss_weight = train_config['sparsity_loss_weight']
         self.topo_reg_loss_weight = train_config.get('topo_reg_loss_weight', 1.0)
+        self.bayes_kl_weight = train_config.get("bayes_kl_weight", 1e-4)
+        self.bayes_warmup_epochs = train_config.get("bayes_warmup_epochs", 20)
+        self.enable_bayes_epoch = train_config.get("enable_bayes_epoch", 20)
         self.save_path = log_folder
 
         self.save_learnable_graph = True
@@ -58,6 +61,8 @@ class BasicTrain:
         self.model.train()
 
         for data_in, pearson, label, _ in self.train_dataloader:
+            if self.current_epoch >= self.enable_bayes_epoch:
+                self.model.use_dkl_bayes = True
             label = label.long()
 
             data_in, pearson, label = data_in.to(
@@ -83,6 +88,14 @@ class BasicTrain:
             topo_reg = getattr(self.model, 'topo_reg_loss', None)
             if topo_reg is not None:
                 loss += self.topo_reg_loss_weight * topo_reg
+
+            bayes_logits = getattr(self.model, "bayes_logits", None)
+            bayes_kl = getattr(self.model, "bayes_kl", None)
+            if bayes_logits is not None and self.current_epoch >= self.bayes_warmup_epochs:
+                bayes_ce = self.loss_fn(bayes_logits, targets_a)
+                loss += 0.1 * bayes_ce
+                if bayes_kl is not None:
+                    loss += self.bayes_kl_weight * bayes_kl
 
             self.train_loss.update_with_weight(loss.item(), label.shape[0])
             optimizer.zero_grad()
@@ -152,6 +165,7 @@ class BasicTrain:
         training_process = []
         txt = ''
         for epoch in range(self.epochs):
+            self.current_epoch = epoch
             self.reset_meters()                                  #重置计量�?
             self.train_per_epoch(self.optimizers[0])
             val_result, _ = self.test_per_epoch(self.val_dataloader,
