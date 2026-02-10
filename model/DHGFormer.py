@@ -141,6 +141,32 @@ class SubnetTokenDKLBayesHead(nn.Module):
 
 
 
+
+class AdditiveKernelRegHead(nn.Module):
+
+    def __init__(self, num_tokens=8, token_dim=8, rff_dim=64):
+        super().__init__()
+        self.rff = TokenAdditiveRFF(token_dim=token_dim, num_tokens=num_tokens, rff_dim=rff_dim, sigma=1.0)
+        self.num_tokens = num_tokens
+        self.rff_dim = rff_dim
+
+    def forward(self, tokens):
+        z = self.rff(tokens)
+        B = z.shape[0]
+        z = z.view(B, self.num_tokens, self.rff_dim)
+
+        zn = F.normalize(z, p=2, dim=-1, eps=1e-8)
+        sim = torch.matmul(zn, zn.transpose(-1, -2))
+        eye = torch.eye(self.num_tokens, device=z.device).unsqueeze(0)
+        offdiag = (sim - eye).abs()
+        loss_ortho = offdiag.mean()
+
+        loss_prior = (z ** 2).mean()
+        return loss_ortho + 0.01 * loss_prior
+
+
+
+
 class CrossGCNPredictor(nn.Module):
 
     def __init__(self, node_input_dim, roi_num=360):
@@ -246,11 +272,10 @@ class CrossGCNPredictor(nn.Module):
         x = self.bn3(x)#[16,200,8]
 
         tokens = self.subnetwork_pool_tokens(x, self.subnetwork_ends)
-        self.subnet_tokens = tokens
+        self.subnet_tokens = tokens.detach()
 
         # Classifier
         x = x.view(batch_size, -1)#后两个维度合并得到[16,1600]
-        self.readout = x
         logits = self.classifier(x)
         return logits#其实就是3个全连接层，把特征维度从1600�?56�?2�?
 
@@ -325,10 +350,9 @@ class DHGFormer(nn.Module):
 
         self.predictor = CrossGCNPredictor(node_feature_dim, roi_num=roi_num)
 
-        self.use_token_dkl_bayes = False
-        self.token_bayes_head = SubnetTokenDKLBayesHead(num_tokens=8, token_dim=8, rff_dim=128, num_classes=2)
-        self.bayes_logits = None
-        self.bayes_kl = torch.tensor(0.0)
+        self.additive_reg_head = AdditiveKernelRegHead(num_tokens=8, token_dim=8, rff_dim=model_config.get("rff_dim", 64))
+        self.additive_kernel_loss = torch.tensor(0.0)
+
 
 
         # Load node cluster mapping
@@ -377,12 +401,9 @@ class DHGFormer(nn.Module):
 
         self.readout = getattr(self.predictor, "readout", None)
         tokens = getattr(self.predictor, "subnet_tokens", None)
-        if tokens is not None and self.use_token_dkl_bayes:
-            bayes_logits, bayes_kl = self.token_bayes_head(tokens.detach(), mc_samples=3)
-            self.bayes_logits = bayes_logits
-            self.bayes_kl = bayes_kl
+        if tokens is not None:
+            self.additive_kernel_loss = self.additive_reg_head(tokens.detach())
         else:
-            self.bayes_logits = None
-            self.bayes_kl = torch.tensor(0.0, device=prediction.device)
+            self.additive_kernel_loss = torch.tensor(0.0, device=prediction.device)
 
         return prediction, full_adjacency, edge_variance#维度分别是[16,2]，[16,200,200]和一个数
