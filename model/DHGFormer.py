@@ -167,12 +167,61 @@ class AdditiveKernelRegHead(nn.Module):
 
 
 
+class GatedMoEClassifier(nn.Module):
+
+    def __init__(
+        self,
+        input_dim,
+        num_classes=2,
+        num_experts=3,
+        shared_dim=256,
+        expert_hidden=128,
+        dropout=0.3,
+        temperature=1.0,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.temperature = temperature
+
+        self.shared_stem = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, shared_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(shared_dim, expert_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(expert_hidden, num_classes),
+            )
+            for _ in range(num_experts)
+        ])
+        self.gate = nn.Linear(shared_dim, num_experts)
+
+    def forward(self, x):
+        x = self.shared_stem(x)#[16,1600]变为[16,256]
+        gate_logits = self.gate(x) / max(self.temperature, 1e-6)#[16,4]
+        gate_probs = torch.softmax(gate_logits, dim=-1)#[16,4]
+
+        expert_logits = torch.stack([expert(x) for expert in self.experts], dim=1)#[16,4,2]
+        logits = torch.sum(gate_probs.unsqueeze(-1) * expert_logits, dim=1)#[16,2]
+
+        mean_gate = gate_probs.mean(dim=0)
+        uniform = torch.full_like(mean_gate, 1.0 / self.num_experts)
+        balance_loss = torch.mean((mean_gate - uniform) ** 2)
+        entropy = -(gate_probs * torch.log(gate_probs + 1e-8)).sum(dim=1).mean()
+        return logits, balance_loss, entropy, gate_probs
+
+
 class CrossGCNPredictor(nn.Module):
 
-    def __init__(self, node_input_dim, roi_num=360):
+    def __init__(self, node_input_dim, roi_num=360, moe_config=None):
         super().__init__()
         self.roi_num = roi_num
         self.subnetwork_ends = [41, 70, 91, 110, 130, 137, 158, 200]
+        moe_config = moe_config or {}
 
         # Graph convolution layers
         self.gcn = nn.Sequential(
@@ -196,14 +245,18 @@ class CrossGCNPredictor(nn.Module):
         )
         self.bn3 = nn.BatchNorm1d(roi_num)
 
-        # Final classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(8 * roi_num, 256),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Linear(256, 32),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Linear(32, 2)
+        self.moe_classifier = GatedMoEClassifier(
+            input_dim=8 * roi_num,
+            num_classes=2,
+            num_experts=moe_config.get("num_experts", 3),
+            shared_dim=moe_config.get("shared_dim", 256),
+            expert_hidden=moe_config.get("expert_hidden", 128),
+            dropout=moe_config.get("dropout", 0.3),
+            temperature=moe_config.get("temperature", 1.0),
         )
+        self.moe_balance_loss = torch.tensor(0.0)
+        self.moe_entropy_loss = torch.tensor(0.0)
+        self.gate_probs = None
 
     def subnetwork_pool_tokens(self, roi_feat, subnetwork_ends):
         return self.average_subnetwork_features(roi_feat, subnetwork_ends)
@@ -276,7 +329,10 @@ class CrossGCNPredictor(nn.Module):
 
         # Classifier
         x = x.view(batch_size, -1)#后两个维度合并得到[16,1600]
-        logits = self.classifier(x)
+        logits, balance_loss, entropy_loss, gate_probs = self.moe_classifier(x)
+        self.moe_balance_loss = balance_loss
+        self.moe_entropy_loss = entropy_loss
+        self.gate_probs = gate_probs.detach()
         return logits#其实就是3个全连接层，把特征维度从1600�?56�?2�?
 
 
@@ -348,10 +404,16 @@ class DHGFormer(nn.Module):
                 roi_num=roi_num
             )
 
-        self.predictor = CrossGCNPredictor(node_feature_dim, roi_num=roi_num)
+        self.predictor = CrossGCNPredictor(
+            node_feature_dim,
+            roi_num=roi_num,
+            moe_config=model_config.get("moe", {}),
+        )
 
         self.additive_reg_head = AdditiveKernelRegHead(num_tokens=8, token_dim=8, rff_dim=model_config.get("rff_dim", 64))
         self.additive_kernel_loss = torch.tensor(0.0)
+        self.moe_balance_loss = torch.tensor(0.0)
+        self.moe_entropy_loss = torch.tensor(0.0)
 
 
 
@@ -397,6 +459,12 @@ class DHGFormer(nn.Module):
             intra_adjacency,
             inter_adjacency,
             node_features
+        )
+        self.moe_balance_loss = getattr(
+            self.predictor, "moe_balance_loss", torch.tensor(0.0, device=prediction.device)
+        )
+        self.moe_entropy_loss = getattr(
+            self.predictor, "moe_entropy_loss", torch.tensor(0.0, device=prediction.device)
         )
 
         self.readout = getattr(self.predictor, "readout", None)

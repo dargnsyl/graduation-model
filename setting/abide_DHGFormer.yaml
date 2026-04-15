@@ -23,6 +23,12 @@ model:
   num_gru_layers: 4
 
   dropout: 0.5
+  moe:
+    num_experts: 4
+    shared_dim: 256
+    expert_hidden: 128
+    dropout: 0.3
+    temperature: 0.7
 
 
 
@@ -36,6 +42,8 @@ train:
   group_loss: true
   sparsity_loss: true
   sparsity_loss_weight: 1.0e-4
+  moe_balance_loss_weight: 1.0e-2
+  moe_entropy_loss_weight: 1.0e-3
   log_folder: result
 
   # uniform or pearson

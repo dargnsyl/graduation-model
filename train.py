@@ -35,6 +35,8 @@ class BasicTrain:
         self.sparsity_loss_weight = train_config['sparsity_loss_weight']
         self.topo_reg_loss_weight = train_config.get('topo_reg_loss_weight', 1.0)
         self.additive_reg_weight = train_config.get("additive_reg_weight", 1e-3)
+        self.moe_balance_loss_weight = train_config.get("moe_balance_loss_weight", 1e-2)
+        self.moe_entropy_loss_weight = train_config.get("moe_entropy_loss_weight", 1e-3)
 
         self.save_path = log_folder
 
@@ -90,6 +92,14 @@ class BasicTrain:
             add_reg = getattr(self.model, "additive_kernel_loss", None)
             if add_reg is not None:
                 loss += self.additive_reg_weight * add_reg
+
+            moe_balance = getattr(self.model, "moe_balance_loss", None)
+            if moe_balance is not None:
+                loss += self.moe_balance_loss_weight * moe_balance
+
+            moe_entropy = getattr(self.model, "moe_entropy_loss", None)
+            if moe_entropy is not None:
+                loss -= self.moe_entropy_loss_weight * moe_entropy
 
             self.train_loss.update_with_weight(loss.item(), label.shape[0])
             optimizer.zero_grad()
