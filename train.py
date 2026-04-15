@@ -39,6 +39,8 @@ class BasicTrain:
         self.moe_entropy_loss_weight = train_config.get("moe_entropy_loss_weight", 1e-3)
 
         self.save_path = log_folder
+        self.save_model_path = Path("save_model")
+        self.run_time_tag = None
 
         self.save_learnable_graph = True
 
@@ -163,7 +165,14 @@ class BasicTrain:
                 results, allow_pickle=True)
         with open(self.save_path / "training_info.txt", 'a', encoding='utf-8') as f:
             f.write(txt)
-        torch.save(self.best_model.state_dict(), self.save_path/f"model_{self.best_acc}%.pt")
+
+        local_model_name = f"model_{self.best_acc:.3f}%.pt"
+        torch.save(self.best_model.state_dict(), self.save_path / local_model_name)
+
+        self.save_model_path.mkdir(exist_ok=True, parents=True)
+        run_tag = self.run_time_tag if self.run_time_tag is not None else datetime.now().strftime("%m-%d-%H-%M-%S")
+        central_model_name = f"{run_tag}_{self.best_acc:.3f}%.pt"
+        torch.save(self.best_model.state_dict(), self.save_model_path / central_model_name)
 
     def train(self):
         training_process = []
@@ -212,6 +221,7 @@ class BasicTrain:
                                     + val_result + test_result)
         now = datetime.now()
         date_time = now.strftime("%m-%d-%H-%M-%S")
+        self.run_time_tag = date_time
         self.save_path = self.save_path/Path(f"{self.best_acc: .3f}%_{date_time}")
         self.logger.info(" | ".join([
             f'Best_ACC[{self.best_acc}]'

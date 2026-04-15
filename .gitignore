@@ -1,6 +1,7 @@
 # results  outputs
 result
 results
+save_model/
 runs
 checkpoints
 .log
