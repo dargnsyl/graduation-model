@@ -43,35 +43,35 @@ def attention(Q, K, V, mask=None, topo_gamma=1.0, topo_tau=2.0, topo_max_hop=6, 
     score = torch.matmul(Q, K.permute(0, 1, 3, 2))
     score /= (Q.shape[-1] ** 0.5)
 
-    topo_reg_loss = torch.tensor(0.0, device=score.device)
+    topo_reg_loss = torch.tensor(0.0, device=score.device)##没写到初稿里，这个拓扑正则化损失也是为了抑制远程注意力分配
 
     if mask is not None:
         fc_bias = torch.abs(mask)
         fc_bias = fc_bias.unsqueeze(1).expand(-1, num_head, -1, -1)
-        score = score + fc_bias
+        score = score + fc_bias##逐元素乘改成加法
 
         fc = torch.abs(mask)
-        bsz, n, _ = fc.shape
-        diag_idx = torch.arange(n, device=fc.device)
-        fc[:, diag_idx, diag_idx] = float("-inf")
-        idx = fc.topk(topo_k, dim=-1).indices  # [B, N, K]
-        adj = torch.zeros_like(fc, dtype=torch.bool)
-        adj.scatter_(-1, idx, True)
-        adj = adj | adj.transpose(-1, -2)
-        dist = _compute_shortest_dist(adj, topo_max_hop)
-        dist = dist.clamp_max(topo_max_hop + 1)
-        decay = torch.exp(-topo_gamma * torch.relu(dist - topo_tau))
-        topo_bias = torch.log(decay + topo_eps).unsqueeze(1).expand(-1, num_head, -1, -1)
-        score = score + topo_bias
+        bsz, n, _ = fc.shape##batch_size和节点数n
+        diag_idx = torch.arange(n, device=fc.device)##从0到199的一维tensor
+        fc[:, diag_idx, diag_idx] = float("-inf")#功能连接矩阵[16,200,200]主对角线全部设为-inf
+        idx = fc.topk(topo_k, dim=-1).indices##每个节点选topo_k个连接最强的邻居节点，维度是[16,200,top_k]
+        adj = torch.zeros_like(fc, dtype=torch.bool)##[16,200,200]的全零矩阵
+        adj.scatter_(-1, idx, True)##如果节点j是i的一个top_k邻居，则把adj[b][i][j]设为1，反之仍为0
+        adj = adj | adj.transpose(-1, -2)##变为对称矩阵，此时adj是一个临时性的稀疏矩阵，每个节点只保留top_k个邻居节点，后面用它算最短距离
+        dist = _compute_shortest_dist(adj, topo_max_hop)##[16,200,200]，任意两点间最短距离，主对角线全为0
+        dist = dist.clamp_max(topo_max_hop + 1)#若节点间不可达则距离设为topo_max_hop + 1
+        decay = torch.exp(-topo_gamma * torch.relu(dist - topo_tau))#节点间距离越远对应的decay越小
+        topo_bias = torch.log(decay + topo_eps).unsqueeze(1).expand(-1, num_head, -1, -1)#映射到score的维度，topo_eps防止对数溢出
+        score = score + topo_bias#注意力加上距离衰减项，距离越远衰减越大，距离小于等于topo_tau则不衰减
 
-        attn = torch.softmax(score, dim=-1)
+        attn = torch.softmax(score, dim=-1)#4头注意力[16,4,200,200]
         dist_penalty = torch.relu(dist - topo_tau).unsqueeze(1)
         topo_reg_loss = (attn * dist_penalty).mean()
     else:
         attn = torch.softmax(score, dim=-1)
-
-    x = torch.matmul(attn, V)
-    x = x.permute(0, 2, 1, 3).reshape(-1, l, num_head * Q.shape[3])
+    #初稿的注意力公式写错了。。。应该是softmax((QK^T)/√d+fc+topo_bias)V
+    x = torch.matmul(attn, V)#[16,4,200,8]
+    x = x.permute(0, 2, 1, 3).reshape(-1, l, num_head * Q.shape[3])#[16,200,32]
     return x, topo_reg_loss
 
 
@@ -119,7 +119,7 @@ class MultiHead(torch.nn.Module):
         )
         self.topo_reg_loss = topo_reg_loss
         score = self.dropout(self.out_fc(score))
-        return score
+        return score#经过嵌入层和dropout，变为[16,200,8]
 
 
 class EncoderLayer(torch.nn.Module):

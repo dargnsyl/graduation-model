@@ -25,8 +25,8 @@ class CrossEmbed2GraphByProduct(nn.Module):
             for j in range(i, num_subnetworks):
                 block = adjacency_matrix[:,
                         subnetwork_starts[i]:subnetwork_ends[i],
-                        subnetwork_starts[j]:subnetwork_ends[j]]#取出子网络i和子网络j之间的邻接矩�?
-                mean_strength = block.mean(dim=(1, 2))#[16]，对block在第1维和�?维同时取平均，视为子网络i和j之间的连接强�?
+                        subnetwork_starts[j]:subnetwork_ends[j]]#取出子网络i和子网络j之间的邻接矩阵
+                mean_strength = block.mean(dim=(1, 2))
                 subnetwork_matrix[:, i, j] = mean_strength
                 subnetwork_matrix[:, j, i] = mean_strength
         return subnetwork_matrix#[16,8,8]
@@ -44,22 +44,18 @@ class CrossEmbed2GraphByProduct(nn.Module):
         for end_index in subnetwork_ends:
             intra_mask[start_index:end_index, start_index:end_index] = True
             start_index = end_index
-#最终intra_mask仍为[200,200]的bool型矩阵，对于subnetwork_ends中的每个数，例如41�?0，以intra_mask[0][0]和intra_mask[41][41]�?
-#左上、右下顶点的子矩阵均为true
-#以intra_mask[41][41]和intra_mask[70][70]为左上、右下顶点的子矩阵均为true
-#以此类推，intra_mask按主对角线划分为8个大小不等的子矩阵，这些子矩阵元素全为true，不在这8个子矩阵中的全为flase
 
-        intra_adjacency = adjacency_matrix * intra_mask.unsqueeze(0)
-#intra_adjacency维度仍为[16,200,200]，根据intra_mask为true的位置不变，false的位置设�?
-#这样intra_adjacency也可看作�?个子矩阵构成的对角阵，表�?个子�?
+#intra_mask按主对角线划分为8个大小不等的子矩阵，每个子矩阵对应一个子网，内部全为true。不在这8个子矩阵内的元素对应子网间连接，设为false
+
+        intra_adjacency = adjacency_matrix * intra_mask.unsqueeze(0)#原来的功能连接矩阵只保留子网内连接
 
         # Compute subnetwork-level connectivity
-        inter_adjacency = self.get_subnetwork_matrix(adjacency_matrix, subnetwork_ends)#[16,8,8]
+        inter_adjacency = self.get_subnetwork_matrix(adjacency_matrix, subnetwork_ends)
 
         # Add channel dimension for consistency
-        intra_adjacency = torch.unsqueeze(intra_adjacency, -1)
-        inter_adjacency = torch.unsqueeze(inter_adjacency, -1)
-        adjacency_matrix = torch.unsqueeze(adjacency_matrix, -1)
+        intra_adjacency = torch.unsqueeze(intra_adjacency, -1)#[16,200,200]子网内
+        inter_adjacency = torch.unsqueeze(inter_adjacency, -1)#[16,8,8]子网间
+        adjacency_matrix = torch.unsqueeze(adjacency_matrix, -1)#[16,200,200]原邻接矩阵
 
         return intra_adjacency, inter_adjacency, adjacency_matrix
 
@@ -81,19 +77,19 @@ class TokenAdditiveRFF(nn.Module):
             self.register_buffer(f"rff_W_{g}", W)
             self.register_buffer(f"rff_b_{g}", b)
 
-    def forward(self, tokens):
-        feats = []
-        scale = math.sqrt(2.0 / self.rff_dim)
-        for g in range(self.num_tokens):
-            W = getattr(self, f"rff_W_{g}")
+    def forward(self, tokens):#每个子网的特征向量做随机傅里叶特征映射
+        feats = []#保存每个子网映射后的特征
+        scale = math.sqrt(2.0 / self.rff_dim)#缩放因子
+        for g in range(self.num_tokens):#num_tokens==8
+            W = getattr(self, f"rff_W_{g}")#取出第g个子网的随机矩阵W和随机偏置项b
             b = getattr(self, f"rff_b_{g}")
             proj = tokens[:, g, :] @ W + b
-            z = scale * torch.cos(proj)
+            z = scale * torch.cos(proj)#z是第g个子网映射后的特征向量，由原来的8维映射到64维
             feats.append(z)
         return torch.cat(feats, dim=-1)
 
 
-class BayesianLinearClassifier(nn.Module):
+class BayesianLinearClassifier(nn.Module):#没用上不用看
 
     def __init__(self, feat_dim, num_classes=2, prior_var=1.0):
         super().__init__()
@@ -124,7 +120,7 @@ class BayesianLinearClassifier(nn.Module):
         return kl_w + kl_b
 
 
-class SubnetTokenDKLBayesHead(nn.Module):
+class SubnetTokenDKLBayesHead(nn.Module):#没用上不用看
 
     def __init__(self, num_tokens=8, token_dim=8, rff_dim=128, num_classes=2):
         super().__init__()
@@ -153,15 +149,15 @@ class AdditiveKernelRegHead(nn.Module):
     def forward(self, tokens):
         z = self.rff(tokens)
         B = z.shape[0]
-        z = z.view(B, self.num_tokens, self.rff_dim)
+        z = z.view(B, self.num_tokens, self.rff_dim)#[16,8,64]，8个子网，每个子网64维特征
 
-        zn = F.normalize(z, p=2, dim=-1, eps=1e-8)
-        sim = torch.matmul(zn, zn.transpose(-1, -2))
-        eye = torch.eye(self.num_tokens, device=z.device).unsqueeze(0)
-        offdiag = (sim - eye).abs()
-        loss_ortho = offdiag.mean()
+        zn = F.normalize(z, p=2, dim=-1, eps=1e-8)#子网特征单位化
+        sim = torch.matmul(zn, zn.transpose(-1, -2))#计算任意两个子网特征相似度，sim维度是[16,8,8]，0表示正交，1表示相同，-1表示相反
+        eye = torch.eye(self.num_tokens, device=z.device).unsqueeze(0)#单位阵
+        offdiag = (sim - eye).abs()#把sim的主对角线置0，其余位置取绝对值
+        loss_ortho = offdiag.mean()#正交损失，不同子网的特征差异越大则这一项越小
 
-        loss_prior = (z ** 2).mean()
+        loss_prior = (z ** 2).mean()#L2正则项，为了让各子网特征向量的模长不要过大
         return loss_ortho + 0.01 * loss_prior
 
 
@@ -201,17 +197,17 @@ class GatedMoEClassifier(nn.Module):
         self.gate = nn.Linear(shared_dim, num_experts)
 
     def forward(self, x):
-        x = self.shared_stem(x)#[16,1600]变为[16,256]
+        x = self.shared_stem(x)#[16,1600]变为[16,256]，对应共享特征提取层
         gate_logits = self.gate(x) / max(self.temperature, 1e-6)#[16,4]
-        gate_probs = torch.softmax(gate_logits, dim=-1)#[16,4]
+        gate_probs = torch.softmax(gate_logits, dim=-1)#[16,4]，对应4个分类头的权重
 
-        expert_logits = torch.stack([expert(x) for expert in self.experts], dim=1)#[16,4,2]
-        logits = torch.sum(gate_probs.unsqueeze(-1) * expert_logits, dim=1)#[16,2]
+        expert_logits = torch.stack([expert(x) for expert in self.experts], dim=1)#[16,4,2]，四个分类头的输出结果
+        logits = torch.sum(gate_probs.unsqueeze(-1) * expert_logits, dim=1)#[16,2]，根据每个分类头的权重，加权求和
 
         mean_gate = gate_probs.mean(dim=0)
         uniform = torch.full_like(mean_gate, 1.0 / self.num_experts)
-        balance_loss = torch.mean((mean_gate - uniform) ** 2)
-        entropy = -(gate_probs * torch.log(gate_probs + 1e-8)).sum(dim=1).mean()
+        balance_loss = torch.mean((mean_gate - uniform) ** 2)#对应论文中的平衡损失
+        entropy = -(gate_probs * torch.log(gate_probs + 1e-8)).sum(dim=1).mean()#样本级门控熵约束
         return logits, balance_loss, entropy, gate_probs
 
 
@@ -274,7 +270,7 @@ class CrossGCNPredictor(nn.Module):
             region_features = features[:, start_idx:end_idx, :]
             subnetwork_features[:, i, :] = region_features.mean(dim=1)
 
-        return subnetwork_features#[16,8,200]表示8个子网，每个子网特征是一个长度为200的向�?
+        return subnetwork_features#[16,8,200]表示8个子网，每个子网特征是一个长度为200的向量
 
     def propagate_subnetwork_features(self, subnetwork_features, node_features, subnetwork_ends):
         subnetwork_starts = [0] + subnetwork_ends[:-1]#0, 41, 70, 91, 110, 130, 137, 158
@@ -321,7 +317,7 @@ class CrossGCNPredictor(nn.Module):
         subnetwork_features = self.average_subnetwork_features(x, self.subnetwork_ends)
         subnetwork_features = torch.einsum('ijk,ijp->ijp', inter_adjacency, subnetwork_features)
         x = self.propagate_subnetwork_features(subnetwork_features, intra_features, self.subnetwork_ends)#[16,200,200]
-        x = self.gcn2(x)#[16,200,8]，gcn2里面的两个全连接层把特征维度�?00�?4�?
+        x = self.gcn2(x)#[16,200,8]
         x = self.bn3(x)#[16,200,8]
 
         tokens = self.subnetwork_pool_tokens(x, self.subnetwork_ends)
@@ -329,7 +325,7 @@ class CrossGCNPredictor(nn.Module):
 
         # Classifier
         x = x.view(batch_size, -1)#后两个维度合并得到[16,1600]
-        logits, balance_loss, entropy_loss, gate_probs = self.moe_classifier(x)
+        logits, balance_loss, entropy_loss, gate_probs = self.moe_classifier(x)#MOE分类头
         self.moe_balance_loss = balance_loss
         self.moe_entropy_loss = entropy_loss
         self.gate_probs = gate_probs.detach()
@@ -435,7 +431,7 @@ class DHGFormer(nn.Module):
         node_features = self.reorder_nodes(node_features, dimension=2)#[16,200,200]
 
         # Extract features and generate graph
-        embeddings = self.feature_extractor(time_series, node_features)
+        embeddings = self.feature_extractor(time_series, node_features)#完成注意力计算和特征维度变换，[16,200,8]
         self.topo_reg_loss = getattr(self.feature_extractor, 'topo_reg_loss', torch.tensor(0.0))#feature_extractor就是Encoder
         embeddings = F.softmax(embeddings, dim=-1)#[16,200,8]，对应论文中的X_A
 
@@ -445,13 +441,13 @@ class DHGFormer(nn.Module):
         )#self.graph_generator对应CrossEmbed2GraphByProduct
 
         # Remove channel dimension
-        full_adjacency = full_adjacency[:, :, :, 0]#[16,200,200]表示全连接的网络，即论文中第一部分的矩阵A
-        intra_adjacency = intra_adjacency[:, :, :, 0]#[16,200,200]可视�?个子矩阵，表示子网络内的连接
-        inter_adjacency = inter_adjacency[:, :, :, 0]#[16,8,8]表示子网络间的连�?
+        full_adjacency = full_adjacency[:, :, :, 0]#[16,200,200]原邻接矩阵
+        intra_adjacency = intra_adjacency[:, :, :, 0]#[16,200,200]子网内
+        inter_adjacency = inter_adjacency[:, :, :, 0]#[16,8,8]子网间
 
         # Compute edge variance regularization
-        batch_size = full_adjacency.shape[0]#16
-        edge_variance = torch.mean(torch.var(full_adjacency.reshape((batch_size, -1)), dim=1))#将全连接矩阵展平后先算方差后取平�?
+        batch_size = full_adjacency.shape[0]
+        edge_variance = torch.mean(torch.var(full_adjacency.reshape((batch_size, -1)), dim=1))#将全连接矩阵展平后先算方差后取平均
 
         # Make prediction
         prediction = self.predictor(
@@ -468,10 +464,10 @@ class DHGFormer(nn.Module):
         )
 
         self.readout = getattr(self.predictor, "readout", None)
-        tokens = getattr(self.predictor, "subnet_tokens", None)
+        tokens = getattr(self.predictor, "subnet_tokens", None)#[16,8,8]，8个子网的提取的特征向量
         if tokens is not None:
             self.additive_kernel_loss = self.additive_reg_head(tokens.detach())
         else:
             self.additive_kernel_loss = torch.tensor(0.0, device=prediction.device)
 
-        return prediction, full_adjacency, edge_variance#维度分别是[16,2]，[16,200,200]和一个数
+        return prediction, full_adjacency, edge_variance

@@ -4,6 +4,7 @@ from numpy.lib import save
 from util import Logger, accuracy, TotalMeter
 import numpy as np
 from pathlib import Path
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import precision_recall_fscore_support
@@ -25,6 +26,8 @@ class BasicTrain:
         self.optimizers = optimizers
         self.best_acc = 0
         self.best_model = None
+        self.best_con_matrix = None
+        self.best_epoch = 0
         self.best_acc_val = 0
         self.best_auc_val = 0
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction='mean')
@@ -42,7 +45,7 @@ class BasicTrain:
         self.save_model_path = Path("save_model")
         self.run_time_tag = None
 
-        self.save_learnable_graph = True
+        self.save_learnable_graph = False
 
         self.init_meters()
 
@@ -174,12 +177,58 @@ class BasicTrain:
         central_model_name = f"{run_tag}_{self.best_acc:.3f}%.pt"
         torch.save(self.best_model.state_dict(), self.save_model_path / central_model_name)
 
+
+    def show_training_curve(self, training_process):
+        training_process = np.asarray(training_process, dtype=float)
+        if training_process.size == 0:
+            return
+
+        epochs = np.arange(1, training_process.shape[0] + 1)
+        training_loss = training_process[:, 1]
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(epochs, training_loss, marker="o", linewidth=2)
+        plt.xlabel("epoch")
+        plt.ylabel("training_loss")
+        plt.title("Training Loss Curve")
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.tight_layout()
+
+    def show_best_confusion_matrix(self):
+        if self.best_con_matrix is None:
+            return
+
+        con_matrix = np.asarray(self.best_con_matrix)
+        plt.figure(figsize=(5, 4))
+        plt.imshow(con_matrix, interpolation="nearest", cmap="Blues")
+        plt.title(f"Best Test Confusion Matrix (Epoch {self.best_epoch + 1})")
+        plt.colorbar()
+
+        tick_marks = np.arange(con_matrix.shape[0])
+        plt.xticks(tick_marks, [str(i) for i in tick_marks])
+        plt.yticks(tick_marks, [str(i) for i in tick_marks])
+        plt.xlabel("Predicted label")
+        plt.ylabel("True label")
+
+        threshold = con_matrix.max() / 2.0 if con_matrix.size > 0 else 0
+        for i in range(con_matrix.shape[0]):
+            for j in range(con_matrix.shape[1]):
+                color = "white" if con_matrix[i, j] > threshold else "black"
+                plt.text(j, i, str(con_matrix[i, j]), ha="center", va="center", color=color)
+
+        plt.tight_layout()
+
+    def show_training_plots(self, training_process):
+        self.show_training_curve(training_process)
+        self.show_best_confusion_matrix()
+        plt.show()
+
     def train(self):
         training_process = []
         txt = ''
         for epoch in range(self.epochs):
             self.current_epoch = epoch
-            self.reset_meters()                                  #重置计量�?
+            self.reset_meters()                                  #重置计量�?
             self.train_per_epoch(self.optimizers[0])
             val_result, _ = self.test_per_epoch(self.val_dataloader,
                                              self.val_loss, self.val_accuracy)
@@ -190,6 +239,8 @@ class BasicTrain:
             if self.best_acc <= self.test_accuracy.avg:
                 self.best_acc = self.test_accuracy.avg
                 self.best_model = self.model
+                self.best_con_matrix = con_matrix.copy()
+                self.best_epoch = epoch
 
             if (con_matrix[0][0] + con_matrix[1][0]) != 0:
                 SEN = con_matrix[0][0] / (con_matrix[0][0] + con_matrix[1][0])
@@ -228,5 +279,6 @@ class BasicTrain:
         ]))
         if self.save_learnable_graph:
             self.generate_save_learnable_matrix()
+        # self.show_training_plots(training_process)
         self.save_result(training_process, txt)
 

@@ -30,6 +30,7 @@ class StandardScaler:
 
         
 def init_dataloader(dataset_config):
+    ##改成自己的路径
     data = np.load("C:\\Users\\28904\\Desktop\\abidedata\\abide.npy", allow_pickle=True).item()
     final_fc = data["timeseires"]##每个ROI的时间序列，维度是[1009,200,100]
     final_pearson = data["corr"]##每个ROI之间的pearson相关系数，维度是[1009,200,200]
